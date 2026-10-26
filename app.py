@@ -458,6 +458,13 @@ def connect():
       created TEXT DEFAULT CURRENT_TIMESTAMP
     );""")
 
+    c.execute("""CREATE TABLE IF NOT EXISTS owner_invitations (
+        merchant TEXT NOT NULL,
+        token_hash TEXT NOT NULL PRIMARY KEY,
+        expires TEXT NOT NULL,
+        used_at TEXT,
+        created TEXT DEFAULT CURRENT_TIMESTAMP
+    )""")
     user_columns={r['name'] for r in c.execute('PRAGMA table_info(users)')}
     if 'must_change_password' not in user_columns:
         c.execute('ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0')
@@ -1316,27 +1323,59 @@ def authenticate_token(token):
                       (_session_token_hash(token),_iso_utc(_utc_now()))).fetchone()
         return _public_user(c,row) if row and row['role'] in AUTH_ROLES else None
 
+def provision_owner_invitation(c, merchant, token, expires):
+    """Offline operator-only helper. Never expose through HTTP or merchant input.
+
+    Caller must establish merchant ownership independently and provision on a
+    controlled synthetic/offline database connection before distributing token.
+    """
+    merchant = str(merchant or '').strip()
+    if not merchant or not c.execute('SELECT 1 FROM shops WHERE id=?', (merchant,)).fetchone():
+        raise ValueError('An existing verified merchant is required.')
+    if not isinstance(token, str) or len(token) < 32:
+        raise ValueError('A high-entropy invitation is required.')
+    if not isinstance(expires, str) or not expires:
+        raise ValueError('An explicit expiry is required.')
+    if expires <= _iso_utc(_utc_now()):
+        raise ValueError('Invitation must expire in the future.')
+    c.execute('INSERT INTO owner_invitations(merchant,token_hash,expires) VALUES(?,?,?)',
+              (merchant, _session_token_hash(token), expires))
+
+
 def bootstrap_owner(data):
     merchant=str(data.get('merchant','')).strip()
     name=' '.join(str(data.get('name','')).strip().split())
     username=str(data.get('username','')).strip()
     password=str(data.get('password',''))
+    invitation=str(data.get('invitation',''))
     if not merchant or not name or not username:
         raise ValueError('Business, owner name, username and password are required.')
     with connect() as c:
         c.execute('BEGIN IMMEDIATE')
-        if c.execute('SELECT 1 FROM users LIMIT 1').fetchone():
+        if c.execute('SELECT 1 FROM users WHERE merchant=? LIMIT 1', (merchant,)).fetchone():
             raise ValueError('Owner setup is already complete. Sign in instead.')
         if not c.execute('SELECT 1 FROM shops WHERE id=?',(merchant,)).fetchone():
-            raise ValueError('Choose an existing business.')
+            raise ValueError('Invalid invitation or business.')
+        invitation_row = c.execute(
+            'SELECT token_hash FROM owner_invitations WHERE merchant=? AND token_hash=? '
+            'AND used_at IS NULL AND expires>?',
+            (merchant, _session_token_hash(invitation), _iso_utc(_utc_now()))
+        ).fetchone()
+        if not invitation_row or len(invitation) < 32:
+            raise ValueError('Invalid or expired invitation.')
         salt,digest=_password_digest(password)
         c.execute('INSERT INTO users(merchant,id,name,username,password_salt,password_hash,role) VALUES(?,?,?,?,?,?,?)',
                   (merchant,'owner',name,username,salt,digest,'owner'))
+        consumed = c.execute(
+            'UPDATE owner_invitations SET used_at=? WHERE merchant=? AND token_hash=? AND used_at IS NULL',
+            (_iso_utc(_utc_now()), merchant, invitation_row['token_hash'])
+        )
+        if consumed.rowcount != 1:
+            raise ValueError('Invitation was already used.')
         token=create_session(c,merchant,'owner')
         row=c.execute('SELECT * FROM users WHERE merchant=? AND id=?',(merchant,'owner')).fetchone()
         user=_public_user(c,row);audit(c,user,'auth.bootstrap','user','owner',{'username':username})
         return {'token':token,'user':user}
-
 def login_user(data):
     username=str(data.get('username','')).strip()
     password=str(data.get('password',''))
