@@ -1314,7 +1314,7 @@ def authenticate_token(token):
                       'ON u.merchant=s.merchant AND u.id=s.user_id '
                       'WHERE s.token_hash=? AND s.expires>? AND u.active=1',
                       (_session_token_hash(token),_iso_utc(_utc_now()))).fetchone()
-        return _public_user(c,row) if row else None
+        return _public_user(c,row) if row and row['role'] in AUTH_ROLES else None
 
 def bootstrap_owner(data):
     merchant=str(data.get('merchant','')).strip()
