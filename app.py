@@ -1603,10 +1603,21 @@ def filter_state_for_user(payload,user):
     out['m5_phase']='m5b-access-hardening+m6b-branch-inventory'
     return out
 
-def require_actor_merchant(user,data):
-    merchant=str(data.get('merchant','')).strip()
-    if merchant and merchant!=user['merchant']:raise PermissionError('This account cannot access another business.')
+def _record_actor_merchant(actor):
+    """Identity supplied by authenticated HTTP code, never request JSON."""
+    if (not isinstance(actor, dict) or not actor.get('id')
+            or not isinstance(actor.get('merchant'), str) or not actor['merchant'].strip()
+            or actor.get('role') not in AUTH_ROLES
+            or actor.get('must_change_password') or actor.get('active') is False):
+        raise PermissionError('Authenticated actor required.')
+    return actor['merchant']
 
+
+def require_actor_merchant(user,data):
+    verified_merchant = _record_actor_merchant(user)
+    merchant=str(data.get('merchant','')).strip()
+    if merchant and merchant!=verified_merchant:raise PermissionError('This account cannot access another business.')
+    data['merchant'] = verified_merchant
 def actor_location_ids(user):
     return {str(x.get('id')) for x in (user.get('locations') or []) if x.get('id')}
 
